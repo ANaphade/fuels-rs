@@ -1,14 +1,11 @@
 use crate::Token;
 use crate::{abi_decoder::ABIDecoder, abi_encoder::ABIEncoder, errors::Error, ParamType};
+use fuels_types::{JsonABI, Property};
 use hex::FromHex;
 use itertools::Itertools;
-use std::convert::TryInto;
+use serde_json;
 use std::str;
 use std::str::FromStr;
-
-use sway_types::{JsonABI, Property};
-
-use serde_json;
 
 pub struct ABIParser {
     fn_selector: Option<Vec<u8>>,
@@ -236,6 +233,9 @@ impl ABIParser {
                 let token = self.tokenize(&s[discriminant], value)?;
 
                 Ok(Token::Enum(Box::new((discriminant as u8, token))))
+            }
+            ParamType::Tuple(_tuple_params) => {
+                todo!("Tuple tokenization for the ABI CLI tool not implemented yet")
             }
         }
     }
@@ -489,10 +489,15 @@ impl ABIParser {
     fn build_fn_selector_params(&self, param: &Property) -> String {
         let mut result: String = String::new();
 
-        if param.type_field.contains("struct ") || param.type_field.contains("enum ") {
+        if param.is_custom_type() {
             // Custom type, need to break down inner fields
-            // Will return `"s(field_1,field_2,...,field_n)"`.
-            result.push_str("s(");
+            // Will return `"e(field_1,field_2,...,field_n)"` if the type is an `Enum`
+            // and return `"s(field_1,field_2,...,field_n)"` if the type is a `Struct`
+            if param.is_struct_type() {
+                result.push_str("s(");
+            } else {
+                result.push_str("e(");
+            }
 
             for (idx, component) in param.components.as_ref().unwrap().iter().enumerate() {
                 let res = self.build_fn_selector_params(component);
@@ -504,7 +509,12 @@ impl ABIParser {
             }
             result.push(')');
         } else {
-            result.push_str(&param.type_field);
+            let param_str_no_whitespace: String = param
+                .type_field
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            result.push_str(&param_str_no_whitespace);
         }
         result
     }
@@ -516,7 +526,7 @@ pub fn parse_param(param: &Property) -> Result<ParamType, Error> {
         // Simple case (primitive types, no arrays, including string)
         Ok(param_type) => Ok(param_type),
         Err(_) => {
-            if param.type_field.contains("struct") || param.type_field.contains("enum") {
+            if param.is_custom_type() {
                 return parse_custom_type_param(param);
             }
             if param.type_field.contains('[') && param.type_field.contains(']') {
@@ -526,10 +536,33 @@ pub fn parse_param(param: &Property) -> Result<ParamType, Error> {
                 }
                 return parse_array_param(param);
             }
+            if param.type_field.starts_with('(') && param.type_field.ends_with(')') {
+                // Try to parse tuple (T, T, ..., T)
+                return parse_tuple_param(param);
+            }
             // Try to parse enum or struct
             parse_custom_type_param(param)
         }
     }
+}
+
+pub fn parse_tuple_param(param: &Property) -> Result<ParamType, Error> {
+    let mut params: Vec<ParamType> = Vec::new();
+
+    let mut chars = param.type_field.chars();
+    chars.next(); // Remove "("
+    chars.next_back(); // Remove ")"
+
+    for ele in chars.as_str().split(',') {
+        let tuple_type = Property {
+            name: "".to_owned(),
+            type_field: ele.trim().to_owned(),
+            components: None,
+        };
+        params.push(parse_param(&tuple_type)?);
+    }
+
+    Ok(ParamType::Tuple(params))
 }
 
 pub fn parse_string_param(param: &Property) -> Result<ParamType, Error> {
@@ -566,27 +599,23 @@ pub fn parse_array_param(param: &Property) -> Result<ParamType, Error> {
 
 pub fn parse_custom_type_param(param: &Property) -> Result<ParamType, Error> {
     let mut params: Vec<ParamType> = vec![];
-
-    match param.components.as_ref() {
-        Some(components) => {
-            for component in components {
+    match &param.components {
+        Some(c) => {
+            for component in c {
                 params.push(parse_param(component)?)
             }
+            if param.is_struct_type() {
+                return Ok(ParamType::Struct(params));
+            }
+            if param.is_enum_type() {
+                return Ok(ParamType::Enum(params));
+            }
+            Err(Error::InvalidType(param.type_field.clone()))
         }
-        None => {
-            return Err(Error::MissingData(
-                "cannot parse custom type with no components".into(),
-            ))
-        }
+        None => Err(Error::MissingData(
+            "cannot parse custom type with no components".into(),
+        )),
     }
-
-    if param.type_field.contains("struct") {
-        return Ok(ParamType::Struct(params));
-    }
-    if param.type_field.contains("enum") {
-        return Ok(ParamType::Enum(params));
-    }
-    Err(Error::InvalidType(param.type_field.clone()))
 }
 
 #[cfg(test)]
@@ -621,6 +650,50 @@ mod tests {
         let expected = "Invalid type: Expected parameter type `[T; n]`, found `str[5]`";
         let result = parse_array_param(&string_prop).unwrap_err().to_string();
         assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_parse_custom_type_params() {
+        let components = vec![
+            Property {
+                name: "vodka".to_string(),
+                type_field: "u64".to_string(),
+                components: None,
+            },
+            Property {
+                name: "redbull".to_string(),
+                type_field: "bool".to_string(),
+                components: None,
+            },
+        ];
+
+        // STRUCT
+        let some_struct = Property {
+            name: String::from("something_you_drink"),
+            type_field: String::from("struct Cocktail"),
+            components: Some(components.clone()),
+        };
+        let struct_result = parse_custom_type_param(&some_struct).unwrap();
+        // Underlying value comparison
+        let expected = ParamType::Struct(vec![ParamType::U64, ParamType::Bool]);
+        assert_eq!(struct_result, expected);
+        let expected_string = "Struct(vec![ParamType::U64,ParamType::Bool])";
+        // String format comparison
+        assert_eq!(struct_result.to_string(), expected_string);
+
+        // ENUM
+        let some_enum = Property {
+            name: String::from("something_you_drink"),
+            type_field: String::from("enum Cocktail"),
+            components: Some(components),
+        };
+        let enum_result = parse_custom_type_param(&some_enum).unwrap();
+        // Underlying value comparison
+        let expected = ParamType::Enum(vec![ParamType::U64, ParamType::Bool]);
+        assert_eq!(enum_result, expected);
+        let expected_string = "Enum(vec![ParamType::U64,ParamType::Bool])";
+        // String format comparison
+        assert_eq!(enum_result.to_string(), expected_string);
     }
 
     #[test]
@@ -808,7 +881,7 @@ mod tests {
             .unwrap();
         println!("encoded: {:?}\n", encoded);
 
-        let expected_encode = "00000000058734b9000000000000000100000000000000020000000000000003";
+        let expected_encode = "000000005898d3a4000000000000000100000000000000020000000000000003";
         assert_eq!(encoded, expected_encode);
 
         let return_value = [
@@ -915,7 +988,7 @@ mod tests {
         println!("encoded: {:?}\n", encoded);
 
         let expected_encode =
-            "00000000507abc250000000000000001000000000000000200000000000000030000000000000004";
+            "000000007456abeb0000000000000001000000000000000200000000000000030000000000000004";
         assert_eq!(encoded, expected_encode);
 
         let return_value = [
@@ -1118,7 +1191,7 @@ mod tests {
         println!("encoded: {:?}\n", encoded);
 
         let expected_encode =
-            "00000000c0e6f721000000000000000a000000000000000100000000000000010000000000000002";
+            "000000001c6b7bb9000000000000000a000000000000000100000000000000010000000000000002";
         assert_eq!(encoded, expected_encode);
 
         let json_abi = r#"
@@ -1165,7 +1238,7 @@ mod tests {
         println!("encoded: {:?}\n", encoded);
 
         let expected_encode =
-            "0000000058c95826000000000000000100000000000000010000000000000002000000000000000a";
+            "00000000f40ff3b5000000000000000100000000000000010000000000000002000000000000000a";
         assert_eq!(encoded, expected_encode);
     }
 
@@ -1208,7 +1281,7 @@ mod tests {
             .unwrap();
         println!("encoded: {:?}\n", encoded);
 
-        let expected_encode = "00000000082e0dfa0000000000000000000000000000002a";
+        let expected_encode = "0000000021b2784f0000000000000000000000000000002a";
         assert_eq!(encoded, expected_encode);
     }
 
@@ -1261,20 +1334,30 @@ mod tests {
             components: None,
         };
 
-        let p = Property {
+        let p_struct = Property {
             name: "my_struct".into(),
             type_field: "struct MyStruct".into(),
-            components: Some(vec![inner_foo, inner_bar]),
+            components: Some(vec![inner_foo.clone(), inner_bar.clone()]),
         };
 
-        let params = vec![p];
+        let params = vec![p_struct];
         let selector = abi.build_fn_selector("my_func", &params).unwrap();
 
         assert_eq!(selector, "my_func(s(bool,u64))");
+
+        let p_enum = Property {
+            name: "my_enum".into(),
+            type_field: "enum MyEnum".into(),
+            components: Some(vec![inner_foo, inner_bar]),
+        };
+        let params = vec![p_enum];
+        let selector = abi.build_fn_selector("my_func", &params).unwrap();
+
+        assert_eq!(selector, "my_func(e(bool,u64))");
     }
 
     #[test]
-    fn fn_selector_nested_custom_type() {
+    fn fn_selector_nested_struct() {
         let abi = ABIParser::new();
 
         let inner_foo = Property {
@@ -1312,6 +1395,97 @@ mod tests {
         let selector = abi.build_fn_selector("my_func", &params).unwrap();
 
         assert_eq!(selector, "my_func(s(bool,s(u64,u32)))");
+    }
+
+    #[test]
+    fn fn_selector_nested_enum() {
+        let abi = ABIParser::new();
+
+        let inner_foo = Property {
+            name: "foo".into(),
+            type_field: "bool".into(),
+            components: None,
+        };
+
+        let inner_a = Property {
+            name: "a".into(),
+            type_field: "u64".into(),
+            components: None,
+        };
+
+        let inner_b = Property {
+            name: "b".into(),
+            type_field: "u32".into(),
+            components: None,
+        };
+
+        let inner_bar = Property {
+            name: "bar".into(),
+            type_field: "enum InnerEnum".into(),
+            components: Some(vec![inner_a, inner_b]),
+        };
+
+        let p = Property {
+            name: "my_enum".into(),
+            type_field: "enum MyEnum".into(),
+            components: Some(vec![inner_foo, inner_bar]),
+        };
+
+        let params = vec![p];
+        println!("params: {:?}\n", params);
+        let selector = abi.build_fn_selector("my_func", &params).unwrap();
+
+        assert_eq!(selector, "my_func(e(bool,e(u64,u32)))");
+    }
+
+    #[test]
+    fn fn_selector_nested_custom_types() {
+        let abi = ABIParser::new();
+
+        let inner_foo = Property {
+            name: "foo".into(),
+            type_field: "bool".into(),
+            components: None,
+        };
+
+        let inner_a = Property {
+            name: "a".into(),
+            type_field: "u64".into(),
+            components: None,
+        };
+
+        let inner_b = Property {
+            name: "b".into(),
+            type_field: "u32".into(),
+            components: None,
+        };
+
+        let mut inner_custom = Property {
+            name: "bar".into(),
+            type_field: "enum InnerEnum".into(),
+            components: Some(vec![inner_a, inner_b]),
+        };
+
+        let p = Property {
+            name: "my_struct".into(),
+            type_field: "struct MyStruct".into(),
+            components: Some(vec![inner_foo.clone(), inner_custom.clone()]),
+        };
+
+        let params = vec![p.clone()];
+        let selector = abi.build_fn_selector("my_func", &params).unwrap();
+
+        assert_eq!(selector, "my_func(s(bool,e(u64,u32)))");
+
+        inner_custom.type_field = "struct InnerStruct".to_string();
+        let p = Property {
+            name: "my_enum".into(),
+            type_field: "enum MyEnum".into(),
+            components: Some(vec![inner_foo, inner_custom]),
+        };
+        let params = vec![p];
+        let selector = abi.build_fn_selector("my_func", &params).unwrap();
+        assert_eq!(selector, "my_func(e(bool,s(u64,u32)))");
     }
 
     #[test]

@@ -1,5 +1,5 @@
 pub mod contract;
-pub mod parameters;
+pub mod errors;
 pub mod script;
 
 pub mod abi_encoder {

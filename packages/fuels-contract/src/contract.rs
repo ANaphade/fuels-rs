@@ -1,6 +1,5 @@
 use crate::abi_decoder::ABIDecoder;
 use crate::abi_encoder::ABIEncoder;
-use crate::parameters::{CallParameters, TxParameters};
 use crate::script::Script;
 use anyhow::Result;
 use fuel_asm::Opcode;
@@ -13,8 +12,12 @@ use fuel_vm::consts::{REG_CGAS, REG_ONE};
 use fuel_vm::prelude::Contract as FuelContract;
 use fuel_vm::script_with_data_offset;
 use fuels_core::errors::Error;
+use fuels_core::ReturnLocation;
 use fuels_core::{
-    constants::DEFAULT_COIN_AMOUNT, constants::WORD_SIZE, Detokenize, Selector, Token,
+    constants::DEFAULT_COIN_AMOUNT,
+    constants::WORD_SIZE,
+    parameters::{CallParameters, TxParameters},
+    Detokenize, Selector, Token,
 };
 use fuels_core::{constants::NATIVE_ASSET_ID, ParamType};
 use fuels_signers::provider::Provider;
@@ -43,6 +46,25 @@ pub struct Contract {
 pub struct CallResponse<D> {
     pub value: D,
     pub receipts: Vec<Receipt>,
+    pub logs: Option<Vec<String>>,
+}
+impl<D> CallResponse<D> {
+    pub fn new(value: D, receipts: Vec<Receipt>) -> Self {
+        // Get all the logs from LogData receipts and put them in the `logs` property
+        let logs_vec = receipts
+            .iter()
+            .filter(|r| matches!(r, Receipt::LogData { .. }))
+            .map(|r| hex::encode(r.data().unwrap()))
+            .collect::<Vec<String>>();
+        Self {
+            value,
+            receipts,
+            logs: match logs_vec.is_empty() {
+                true => None,
+                false => Some(logs_vec),
+            },
+        }
+    }
 }
 
 impl Contract {
@@ -337,37 +359,54 @@ impl Contract {
         })
     }
 
-    // Returns true if the method call takes custom inputs or has more than one argument. This is used to determine whether we need to compute the `call_data_offset`.
+    // If the data passed into the contract method is an integer or a
+    // boolean, then the data itself should be passed. Otherwise, it
+    // should simply pass a pointer to the data in memory. For more
+    // information, see https://github.com/FuelLabs/sway/issues/1368.
     fn should_compute_call_data_offset(args: &[Token]) -> bool {
-        match args
-            .iter()
-            .any(|t| matches!(t, Token::Struct(_) | Token::Enum(_)))
-        {
-            true => true,
-            false => args.len() > 1,
-        }
+        args.len() > 1
+            || args.iter().any(|t| {
+                matches!(
+                    t,
+                    Token::String(_)
+                        | Token::Struct(_)
+                        | Token::Enum(_)
+                        | Token::B256(_)
+                        | Token::Tuple(_)
+                        | Token::Array(_)
+                        | Token::Byte(_)
+                )
+            })
     }
 
     /// Deploys a compiled contract to a running node
     /// To deploy a contract, you need a wallet with enough assets to pay for deployment. This
     /// wallet will also receive the change.
     pub async fn deploy(
-        compiled_contract: &CompiledContract,
-        provider: &Provider,
+        binary_filepath: &str,
         wallet: &LocalWallet,
         params: TxParameters,
     ) -> Result<ContractId, Error> {
+        let compiled_contract = Contract::load_sway_contract(binary_filepath).unwrap();
+
         let (mut tx, contract_id) =
-            Self::contract_deployment_transaction(compiled_contract, wallet, params).await?;
+            Self::contract_deployment_transaction(&compiled_contract, wallet, params).await?;
         wallet.sign_transaction(&mut tx).await?;
 
-        match provider.client.submit(&tx).await {
+        match wallet.provider.client.submit(&tx).await {
             Ok(_) => Ok(contract_id),
             Err(e) => Err(Error::TransactionError(e.to_string())),
         }
     }
 
-    pub fn load_sway_contract(binary_filepath: &str, salt: Salt) -> Result<CompiledContract> {
+    pub fn load_sway_contract(binary_filepath: &str) -> Result<CompiledContract> {
+        Self::load_sway_contract_with_salt(binary_filepath, Salt::from([0u8; 32]))
+    }
+
+    pub fn load_sway_contract_with_salt(
+        binary_filepath: &str,
+        salt: Salt,
+    ) -> Result<CompiledContract> {
         let bin = std::fs::read(binary_filepath)?;
         Ok(CompiledContract { raw: bin, salt })
     }
@@ -522,29 +561,23 @@ where
 
         // If it's an ABI method without a return value, exit early.
         if self.output_params.is_empty() {
-            return Ok(CallResponse {
-                value: D::from_tokens(vec![])?,
-                receipts,
-            });
+            return Ok(CallResponse::new(D::from_tokens(vec![])?, receipts));
         }
 
         let (decoded_value, receipts) = Self::get_decoded_output(receipts, &self.output_params)?;
-        Ok(CallResponse {
-            value: D::from_tokens(decoded_value)?,
-            receipts,
-        })
+        Ok(CallResponse::new(D::from_tokens(decoded_value)?, receipts))
     }
 
     /// Call a contract's method on the node, in a state-modifying manner.
     pub async fn call(self) -> Result<CallResponse<D>, Error> {
-        Ok(Self::call_or_simulate(self, false).await?)
+        Self::call_or_simulate(self, false).await
     }
 
     /// Call a contract's method on the node, in a simulated manner, meaning the state of the
     /// blockchain is *not* modified but simulated.
     /// It is the same as the `call` method because the API is more user-friendly this way.
     pub async fn simulate(self) -> Result<CallResponse<D>, Error> {
-        Ok(Self::call_or_simulate(self, true).await?)
+        Self::call_or_simulate(self, true).await
     }
 
     /// Based on the returned Contract's output_params and the receipts returned from the call,
@@ -553,27 +586,35 @@ where
         mut receipts: Vec<Receipt>,
         output_params: &[ParamType],
     ) -> Result<(Vec<Token>, Vec<Receipt>), Error> {
-        // Right now we only support methods with a single return type.
-        // Soon we'll support tuple as a return type and we'll have to update the logic in here.
+        // Multiple returns are handled as one `Tuple` (which has its own `ParamType`), so getting
+        // more than one output param is an error.
+        if output_params.len() != 1 {
+            return Err(Error::InvalidType(format!(
+                "Received too many output params (expected 1 got {})",
+                output_params.len()
+            )));
+        }
         let output_param = output_params[0].clone();
-        // If the method's return type is bigger than a single `WORD`, the returned value
-        // is stored in `ReturnData.data`, otherwise, it's stored in `Return.val`.
-        // Here we're checking for that.
-        let (encoded_value, index) = match output_param.bigger_than_word() {
-            true => match receipts.iter().find(|&receipt| receipt.data().is_some()) {
-                Some(r) => {
-                    let index = receipts.iter().position(|elt| elt == r).unwrap();
-                    (r.data().unwrap().to_vec(), Some(index))
+
+        let (encoded_value, index) = match output_param.get_return_location() {
+            ReturnLocation::ReturnData => {
+                match receipts.iter().find(|&receipt| receipt.data().is_some()) {
+                    Some(r) => {
+                        let index = receipts.iter().position(|elt| elt == r).unwrap();
+                        (r.data().unwrap().to_vec(), Some(index))
+                    }
+                    None => (vec![], None),
                 }
-                None => (vec![], None),
-            },
-            false => match receipts.iter().find(|&receipt| receipt.val().is_some()) {
-                Some(r) => {
-                    let index = receipts.iter().position(|elt| elt == r).unwrap();
-                    (r.val().unwrap().to_be_bytes().to_vec(), Some(index))
+            }
+            ReturnLocation::Return => {
+                match receipts.iter().find(|&receipt| receipt.val().is_some()) {
+                    Some(r) => {
+                        let index = receipts.iter().position(|elt| elt == r).unwrap();
+                        (r.val().unwrap().to_be_bytes().to_vec(), Some(index))
+                    }
+                    None => (vec![], None),
                 }
-                None => (vec![], None),
-            },
+            }
         };
         if let Some(i) = index {
             receipts.remove(i);

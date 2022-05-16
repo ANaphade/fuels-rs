@@ -1,5 +1,7 @@
+#[cfg(feature = "fuel-core")]
 use fuel_core::service::{Config, FuelService};
 use fuel_gql_client::client::schema::coin::Coin;
+use fuel_gql_client::client::types::TransactionResponse;
 use fuel_gql_client::client::{FuelClient, PageDirection, PaginationRequest};
 use fuel_tx::Receipt;
 use fuel_tx::{Address, AssetId, Input, Output, Transaction};
@@ -9,6 +11,7 @@ use std::net::SocketAddr;
 
 use fuel_vm::prelude::Opcode;
 use fuels_core::errors::Error;
+use fuels_core::parameters::TxParameters;
 use thiserror::Error;
 
 /// An error involving a signature.
@@ -37,9 +40,10 @@ impl Provider {
     pub async fn send_transaction(&self, tx: &Transaction) -> io::Result<Vec<Receipt>> {
         let tx_id = self.client.submit(tx).await?;
 
-        Ok(self.client.receipts(&tx_id.0.to_string()).await?)
+        self.client.receipts(&tx_id.0.to_string()).await
     }
 
+    #[cfg(feature = "fuel-core")]
     /// Launches a local `fuel-core` network based on provided config.
     pub async fn launch(config: Config) -> Result<FuelClient, Error> {
         let srv = FuelService::new_node(config).await.unwrap();
@@ -95,6 +99,7 @@ impl Provider {
                 &from.to_string(),
                 vec![(format!("{:#x}", asset_id).as_str(), amount)],
                 None,
+                None,
             )
             .await?;
 
@@ -102,15 +107,20 @@ impl Provider {
     }
 
     /// Craft a transaction used to transfer funds between two addresses.
-    pub fn build_transfer_tx(&self, inputs: &[Input], outputs: &[Output]) -> Transaction {
+    pub fn build_transfer_tx(
+        &self,
+        inputs: &[Input],
+        outputs: &[Output],
+        params: TxParameters,
+    ) -> Transaction {
         // This script contains a single Opcode that returns immediately (RET)
         // since all this transaction does is move Inputs and Outputs around.
         let script = Opcode::RET(REG_ONE).to_bytes().to_vec();
         Transaction::Script {
-            gas_price: 0,
-            gas_limit: 1_000_000,
-            byte_price: 0,
-            maturity: 0,
+            gas_price: params.gas_price,
+            gas_limit: params.gas_limit,
+            byte_price: params.byte_price,
+            maturity: params.maturity,
             receipts_root: Default::default(),
             script,
             script_data: vec![],
@@ -119,6 +129,11 @@ impl Provider {
             witnesses: vec![],
             metadata: None,
         }
+    }
+
+    /// Get transaction by id.
+    pub async fn get_transaction_by_id(&self, tx_id: &str) -> io::Result<TransactionResponse> {
+        Ok(self.client.transaction(tx_id).await.unwrap().unwrap())
     }
 
     // @todo

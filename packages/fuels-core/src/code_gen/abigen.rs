@@ -2,19 +2,16 @@ use std::collections::HashMap;
 
 use crate::code_gen::bindings::ContractBindings;
 use crate::code_gen::custom_types_gen::{
-    expand_internal_enum, expand_internal_struct, extract_custom_type_name_from_abi_property,
+    expand_custom_enum, expand_custom_struct, extract_custom_type_name_from_abi_property,
 };
 use crate::code_gen::functions_gen::expand_function;
 use crate::errors::Error;
 use crate::json_abi::ABIParser;
 use crate::source::Source;
 use crate::utils::ident;
-use sway_types::{JsonABI, Property};
-
+use fuels_types::{JsonABI, Property};
 use proc_macro2::{Ident, TokenStream};
 use quote::quote;
-
-use super::custom_types_gen::CustomType;
 
 pub struct Abigen {
     /// The parsed ABI.
@@ -56,10 +53,17 @@ impl Abigen {
                 None => continue,
             };
         }
-
+        let custom_types = Abigen::get_custom_types(&parsed_abi);
         Ok(Self {
-            custom_structs: Abigen::get_custom_types(&parsed_abi, &CustomType::Struct),
-            custom_enums: Abigen::get_custom_types(&parsed_abi, &CustomType::Enum),
+            custom_structs: custom_types
+                .clone()
+                .into_iter()
+                .filter(|(_, p)| p.is_struct_type())
+                .collect(),
+            custom_enums: custom_types
+                .into_iter()
+                .filter(|(_, p)| p.is_enum_type())
+                .collect(),
             abi: parsed_abi,
             contract_name: ident(contract_name),
             abi_parser: ABIParser::new(),
@@ -112,22 +116,21 @@ impl Abigen {
             (
                 quote! {
                     use fuel_tx::{ContractId, Address};
-                    use fuels_rs::contract::contract::{Contract, ContractCall};
-                    use fuels_rs::signers::{provider::Provider, LocalWallet};
+                    use fuels::contract::contract::{Contract, ContractCall};
+                    use fuels::signers::LocalWallet;
                     use std::str::FromStr;
                 },
                 quote! {
                     pub struct #name {
                         contract_id: ContractId,
-                        provider: Provider,
                         wallet: LocalWallet
                     }
 
                     impl #name {
-                        pub fn new(contract_id: String, provider: Provider, wallet: LocalWallet)
+                        pub fn new(contract_id: String, wallet: LocalWallet)
                         -> Self {
                             let contract_id = ContractId::from_str(&contract_id).unwrap();
-                            Self{ contract_id, provider, wallet }
+                            Self{ contract_id, wallet }
                         }
                         #contract_functions
                     }
@@ -145,7 +148,7 @@ impl Abigen {
                 #![allow(unused_imports)]
 
                 #includes
-                use fuels_rs::core::{EnumSelector, ParamType, Tokenizable, Token};
+                use fuels::core::{Detokenize, EnumSelector, ParamType, Tokenizable, Token};
 
                 #code
 
@@ -186,7 +189,7 @@ impl Abigen {
             }
 
             if !seen_struct.contains(&prop.type_field.as_str()) {
-                structs.extend(expand_internal_struct(prop)?);
+                structs.extend(expand_custom_struct(prop)?);
                 seen_struct.push(&prop.type_field);
             }
         }
@@ -198,22 +201,13 @@ impl Abigen {
         let mut enums = TokenStream::new();
 
         for (name, prop) in &self.custom_enums {
-            enums.extend(expand_internal_enum(name, prop)?);
+            enums.extend(expand_custom_enum(name, prop)?);
         }
 
         Ok(enums)
     }
 
-    /// Reads the parsed ABI and returns the custom structs found in it.
-    fn get_custom_types(abi: &JsonABI, ty: &CustomType) -> HashMap<String, Property> {
-        let mut structs = HashMap::new();
-        let mut inner_structs: Vec<Property> = Vec::new();
-
-        let type_string = match ty {
-            CustomType::Enum => "enum",
-            CustomType::Struct => "struct",
-        };
-
+    fn get_all_properties(abi: &JsonABI) -> Vec<&Property> {
         let mut all_properties: Vec<&Property> = vec![];
         for function in abi {
             for prop in &function.inputs {
@@ -223,47 +217,55 @@ impl Abigen {
                 all_properties.push(prop);
             }
         }
+        all_properties
+    }
+
+    /// Reads the parsed ABI and returns the custom types (either `struct` or `enum`) found in it.
+    fn get_custom_types(abi: &JsonABI) -> HashMap<String, Property> {
+        let mut custom_types = HashMap::new();
+        let mut nested_custom_types: Vec<Property> = Vec::new();
+
+        let all_properties = Abigen::get_all_properties(abi);
 
         for prop in all_properties {
-            if prop.type_field.contains(type_string) {
-                // Top level struct
-                let custom_type_name = extract_custom_type_name_from_abi_property(prop, ty)
+            if prop.is_custom_type() {
+                // Top level custom type
+                let custom_type_name = extract_custom_type_name_from_abi_property(prop, None)
                     .expect("failed to extract custom type name");
-                structs
+                custom_types
                     .entry(custom_type_name)
                     .or_insert_with(|| prop.clone());
 
-                // Find inner structs in case of nested custom types
+                // Find inner {structs, enums} in case of nested custom types
                 for inner_component in prop.components.as_ref().unwrap() {
-                    inner_structs.extend(Abigen::get_inner_custom_properties(
-                        inner_component,
-                        type_string,
-                    ));
+                    nested_custom_types
+                        .extend(Abigen::get_nested_custom_properties(inner_component));
                 }
             }
         }
 
-        for inner_struct in inner_structs {
-            let inner_custom_type_name =
-                extract_custom_type_name_from_abi_property(&inner_struct, ty)
-                    .expect("failed to extract custom type name");
-            structs
-                .entry(inner_custom_type_name)
-                .or_insert(inner_struct);
+        for nested_custom_type in nested_custom_types {
+            // A {struct, enum} can contain another {struct, enum}
+            let nested_custom_type_name =
+                extract_custom_type_name_from_abi_property(&nested_custom_type, None)
+                    .expect("failed to extract nested custom type name");
+            custom_types
+                .entry(nested_custom_type_name)
+                .or_insert(nested_custom_type);
         }
 
-        structs
+        custom_types
     }
 
     // Recursively gets inner properties defined in nested structs or nested enums
-    fn get_inner_custom_properties(prop: &Property, ty: &str) -> Vec<Property> {
+    fn get_nested_custom_properties(prop: &Property) -> Vec<Property> {
         let mut props = Vec::new();
 
-        if prop.type_field.contains(ty) {
+        if prop.is_custom_type() {
             props.push(prop.clone());
 
             for inner_prop in prop.components.as_ref().unwrap() {
-                let inner = Abigen::get_inner_custom_properties(inner_prop, ty);
+                let inner = Abigen::get_nested_custom_properties(inner_prop);
                 props.extend(inner);
             }
         }
@@ -432,7 +434,7 @@ mod tests {
                 ],
                 "name":"takes_nested_struct",
                 "outputs":[
-                
+
                 ]
             }
         ]
@@ -589,5 +591,122 @@ mod tests {
 
         let contract = Abigen::new("custom", contract).unwrap();
         let _bindings = contract.generate().unwrap();
+    }
+    #[test]
+    fn test_abigen_struct_inside_enum() {
+        let contract = r#"
+[
+  {
+    "type": "function",
+    "inputs": [
+      {
+        "name": "b",
+        "type": "enum Bar",
+        "components": [
+          {
+            "name": "waiter",
+            "type": "struct Waiter",
+            "components": [
+              {
+                "name": "name",
+                "type": "u8",
+                "components": null
+              },
+              {
+                "name": "male",
+                "type": "bool",
+                "components": null
+              }
+            ]
+          },
+          {
+            "name": "table",
+            "type": "u32",
+            "components": null
+          }
+        ]
+      }
+    ],
+    "name": "struct_inside_enum",
+    "outputs": []
+  }
+]
+        "#;
+
+        let contract = Abigen::new("custom", contract).unwrap();
+        assert_eq!(contract.custom_structs.len(), 1);
+        assert_eq!(contract.custom_enums.len(), 1);
+    }
+
+    #[test]
+    fn test_get_custom_types_nested_structs_and_enums() {
+        let contract = r#"
+[
+  {
+    "type": "function",
+    "inputs": [
+      {
+        "name": "c",
+        "type": "struct Cocktail",
+        "components": [
+          {
+            "name": "shaker",
+            "type": "enum Shaker",
+            "components": [
+              {
+                "name": "Cosmopolitan",
+                "type": "struct Recipe",
+                "components": [
+                      {
+                        "name": "vodka",
+                        "type": "enum PolishAlcohol",
+                        "components": [
+                              {
+                                "name": "potatoes",
+                                "type": "u64",
+                                "components": null
+                              },
+                              {
+                                "name": "alcohol",
+                                "type": "u64",
+                                "components": null
+                              }
+                        ]
+                      },
+                      {
+                        "name": "cramberry",
+                        "type": "u64",
+                        "components": null
+                      }
+                ]
+              },
+              {
+                "name": "Mojito",
+                "type": "u32",
+                "components": null
+              }
+            ]
+          },
+          {
+            "name": "glass",
+            "type": "u64",
+            "components": null
+          }
+        ]
+      }
+    ],
+    "name": "give_and_return_enum_inside_struct",
+    "outputs": []
+  }
+]
+        "#;
+
+        let contract = Abigen::new("custom", contract).unwrap();
+        assert!(contract.custom_structs.contains_key("Cocktail"));
+        assert!(contract.custom_structs.contains_key("Recipe"));
+        assert_eq!(contract.custom_structs.len(), 2);
+        assert!(contract.custom_enums.contains_key("Shaker"));
+        assert!(contract.custom_enums.contains_key("PolishAlcohol"));
+        assert_eq!(contract.custom_enums.len(), 2);
     }
 }
