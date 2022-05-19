@@ -2,7 +2,9 @@
 use fuel_core::service::{Config, FuelService};
 use fuel_gql_client::client::schema::coin::Coin;
 use fuel_gql_client::client::types::TransactionResponse;
-use fuel_gql_client::client::{FuelClient, PageDirection, PaginationRequest};
+use fuel_gql_client::client::{
+    schema, FuelClient, PageDirection, PaginatedResult, PaginationRequest,
+};
 use fuel_tx::Receipt;
 use fuel_tx::{Address, AssetId, Input, Output, Transaction};
 use fuel_vm::consts::REG_ONE;
@@ -131,6 +133,35 @@ impl Provider {
         }
     }
 
+    /// Get the balance of all spendable coins `asset_id` for address `address`. This is different
+    /// from getting coins because we are just returning a number (the sum of UTXOs) instead of the
+    /// UTXOs.
+    pub async fn get_asset_balance(
+        &self,
+        address: &Address,
+        asset_id: AssetId,
+    ) -> std::io::Result<u64> {
+        self.client
+            .balance(&*address.to_string(), Some(&*asset_id.to_string()))
+            .await
+    }
+
+    /// Get all the balances of all assets for address `address`. This is different from getting
+    /// the coins because we are only returning the sum of UTXOs and not the UTXOs themselves
+    pub async fn get_balances(
+        &self,
+        address: &Address,
+    ) -> io::Result<PaginatedResult<schema::balance::Balance, String>> {
+        let pagination = PaginationRequest {
+            cursor: None,
+            results: 9999,
+            direction: PageDirection::Forward,
+        };
+        self.client
+            .balances(&*address.to_string(), pagination)
+            .await
+    }
+
     /// Get transaction by id.
     pub async fn get_transaction_by_id(&self, tx_id: &str) -> io::Result<TransactionResponse> {
         Ok(self.client.transaction(tx_id).await.unwrap().unwrap())
@@ -139,4 +170,22 @@ impl Provider {
     // @todo
     // - Get transaction(s)
     // - Get block(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::LocalWallet;
+    use fuels::prelude::{setup_address_and_coins, setup_test_provider};
+    #[tokio::test]
+    async fn test_balance() {
+        let (private_key, coins) = setup_address_and_coins(10, 11);
+        let (provider, _) = setup_test_provider(coins).await;
+        let wallet = LocalWallet::new_from_private_key(private_key, provider);
+        for (_utxo_id, coin) in coins {
+            let balance = provider
+                .get_asset_balance(&wallet.address, coin.asset_id)
+                .await;
+            assert_eq!(balance.unwrap(), 10);
+        }
+    }
 }
