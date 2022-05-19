@@ -24,6 +24,7 @@ impl Script {
     pub async fn call(self, fuel_client: &FuelClient) -> Result<Vec<Receipt>, Error> {
         let tx_id = fuel_client.submit(&self.tx).await?.0.to_string();
         let receipts = fuel_client.receipts(&tx_id).await?;
+        println!("RECEIPTS in call: {:?}", receipts);
         let status = fuel_client.transaction_status(&tx_id).await?;
         match status {
             TransactionStatus::Failure { reason, .. } => Err(Error::ContractCallError(reason)),
