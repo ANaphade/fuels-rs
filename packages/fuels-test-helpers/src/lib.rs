@@ -73,7 +73,7 @@ pub async fn setup_test_client(
         },
         database_type: DbType::InMemory,
         utxo_validation: true,
-        ..node_config // ..Config::local_node()
+        ..node_config
     };
 
     let srv = FuelService::new_node(config).await.unwrap();
